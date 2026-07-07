@@ -157,8 +157,9 @@ function Index() {
           {/* Vertical vignette — always present, keeps top nav + bottom scroll cue legible. */}
           <div className="pointer-events-none absolute inset-0 bg-gradient-to-b from-background/70 via-background/10 to-background/80" />
 
+          {/* Headline — true center of screen on mobile; unchanged in-flow position on desktop */}
           <div
-            className="relative z-10 flex flex-col items-center text-center transition-all duration-700 ease-out"
+            className="absolute inset-0 z-10 flex flex-col items-center justify-center px-4 text-center transition-all duration-700 ease-out md:static md:inset-auto md:justify-start"
             style={{
               opacity: heroFaded ? 0 : 1,
               transform: `translateY(${heroFaded ? -20 : 0}px)`,
@@ -171,12 +172,19 @@ function Index() {
               A sanctuary of light,<br />
               <span className="italic text-gold-gradient">shadow &amp; craft.</span>
             </h1>
+          </div>
 
-            <div className="mt-8 flex animate-pulse items-center gap-3 text-[10px] uppercase tracking-[0.4em] text-cream/70">
-              <span className="h-px w-10 bg-gold/60" />
-              Scroll to enter
-              <span className="h-px w-10 bg-gold/60" />
-            </div>
+          {/* Scroll cue — stays anchored at its original bottom position on every screen size */}
+          <div
+            className="relative z-10 flex animate-pulse items-center gap-3 text-[10px] uppercase tracking-[0.4em] text-cream/70 transition-all duration-700 ease-out md:mt-8"
+            style={{
+              opacity: heroFaded ? 0 : 1,
+              transform: `translateY(${heroFaded ? -20 : 0}px)`,
+            }}
+          >
+            <span className="h-px w-10 bg-gold/60" />
+            Scroll to enter
+            <span className="h-px w-10 bg-gold/60" />
           </div>
         </section>
       </div>
