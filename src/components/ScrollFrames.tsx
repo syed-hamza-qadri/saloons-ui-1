@@ -9,32 +9,13 @@ interface Props {
 /**
  * Fixed full-viewport canvas driven by scroll progress.
  *
- * Loading strategy (two phases):
- * 1. Fast start — load a small initial batch of frames (high priority,
- *    high concurrency) and reveal the site the moment those are ready.
- *    This is what the loader bar (0→100%) tracks, so it finishes quickly.
- * 2. Background stream — the remaining frames keep loading quietly at a
- *    lower concurrency so they don't compete with the user's interaction.
- *    If the user scrolls ahead of what's loaded, we draw the nearest
- *    frame that IS ready instead of nothing, so it's never blank/broken.
+ * Loading strategy:
+ * - We block the page (lock body scroll) and display a branded loader until
+ *   EVERY frame is decoded. Only then do we reveal the site — this guarantees
+ *   the first scroll is silky, since no frame is ever missing.
+ * - After ready, we lerp `current` toward `target` on every rAF tick so quick
+ *   scroll input translates into a smooth camera glide.
  */
-const INITIAL_BATCH = 24; // enough for the first stretch of scroll; loads almost instantly
-const INITIAL_CONCURRENCY = 32;
-const BACKGROUND_CONCURRENCY = 6;
-
-function findNearestLoaded(
-  images: (HTMLImageElement | null)[],
-  idx: number
-): HTMLImageElement | null {
-  if (images[idx]) return images[idx];
-  const max = images.length;
-  for (let r = 1; r < max; r++) {
-    if (idx - r >= 0 && images[idx - r]) return images[idx - r];
-    if (idx + r < max && images[idx + r]) return images[idx + r];
-  }
-  return null;
-}
-
 export function ScrollFramesCanvas({ progress }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const imagesRef = useRef<(HTMLImageElement | null)[]>([]);
@@ -49,81 +30,47 @@ export function ScrollFramesCanvas({ progress }: Props) {
 
   const total = FRAME_URLS.length;
 
-  // Preload: fast initial batch first, then stream the rest in the background.
+  // Preload every frame in parallel batches; only ready when 100% decoded.
   useEffect(() => {
     imagesRef.current = new Array(total).fill(null);
+
     let cancelled = false;
+    let cursor = 0;
+    const CONCURRENCY = 32;
+    let inFlight = 0;
+    let loadedCount = 0;
 
-    const loadOne = (idx: number, priority: boolean, onDone: () => void) => {
-      const img = new Image();
-      img.decoding = "async";
-      if (priority) {
-        // Supported in modern Chromium/Firefox; harmless no-op elsewhere.
-        (img as unknown as { fetchPriority?: string }).fetchPriority = "high";
+    const loadNext = () => {
+      if (cancelled) return;
+      while (inFlight < CONCURRENCY && cursor < total) {
+        const idx = cursor++;
+        inFlight++;
+        const img = new Image();
+        img.decoding = "async";
+        img.src = FRAME_URLS[idx];
+        const done = () => {
+          if (cancelled) return;
+          inFlight--;
+          loadedCount++;
+          setLoadProgress(loadedCount / total);
+          if (loadedCount === total) setReady(true);
+          loadNext();
+        };
+        img.onload = () => {
+          imagesRef.current[idx] = img;
+          done();
+        };
+        img.onerror = done;
       }
-      img.src = FRAME_URLS[idx];
-      const finish = () => {
-        if (cancelled) return;
-        onDone();
-      };
-      img.onload = () => {
-        if (!cancelled) imagesRef.current[idx] = img;
-        finish();
-      };
-      img.onerror = finish;
     };
-
-    const firstBatchSize = Math.min(INITIAL_BATCH, total);
-
-    const runBackgroundBatch = () => {
-      let cursor = firstBatchSize;
-      let inFlight = 0;
-      const next = () => {
-        if (cancelled) return;
-        while (inFlight < BACKGROUND_CONCURRENCY && cursor < total) {
-          const idx = cursor++;
-          inFlight++;
-          loadOne(idx, false, () => {
-            inFlight--;
-            next();
-          });
-        }
-      };
-      next();
-    };
-
-    const runFirstBatch = () => {
-      let cursor = 0;
-      let inFlight = 0;
-      let loadedCount = 0;
-      const next = () => {
-        if (cancelled) return;
-        while (inFlight < INITIAL_CONCURRENCY && cursor < firstBatchSize) {
-          const idx = cursor++;
-          inFlight++;
-          loadOne(idx, true, () => {
-            inFlight--;
-            loadedCount++;
-            setLoadProgress(loadedCount / firstBatchSize);
-            if (loadedCount === firstBatchSize) {
-              setReady(true);
-              runBackgroundBatch();
-            }
-            next();
-          });
-        }
-      };
-      next();
-    };
-
-    runFirstBatch();
+    loadNext();
 
     return () => {
       cancelled = true;
     };
   }, [total]);
 
-  // Lock the page while the initial batch is loading so the first scroll is smooth.
+  // Lock the page while frames are loading so the first scroll is smooth.
   useEffect(() => {
     if (ready) return;
     const prevHtml = document.documentElement.style.overflow;
@@ -161,8 +108,7 @@ export function ScrollFramesCanvas({ progress }: Props) {
     targetRef.current = Math.min(1, Math.max(0, progress));
   }, [progress]);
 
-  // rAF loop: lerp current → target and paint, falling back to the nearest
-  // already-loaded frame if the exact one hasn't streamed in yet.
+  // rAF loop: lerp current → target and paint.
   useEffect(() => {
     if (!ready) return;
     const canvas = canvasRef.current;
@@ -179,7 +125,7 @@ export function ScrollFramesCanvas({ progress }: Props) {
       const idx = Math.round(currentRef.current * (total - 1));
 
       if (idx !== lastDrawnRef.current && idx >= 0) {
-        const img = findNearestLoaded(imagesRef.current, idx);
+        const img = imagesRef.current[idx];
         if (img) {
           const cw = canvas.width;
           const ch = canvas.height;
@@ -252,3 +198,4 @@ export function ScrollFramesCanvas({ progress }: Props) {
     </>
   );
 }
+
