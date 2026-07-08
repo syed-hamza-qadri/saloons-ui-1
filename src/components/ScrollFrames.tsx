@@ -9,16 +9,81 @@ interface Props {
 /**
  * Fixed full-viewport canvas driven by scroll progress.
  *
- * Loading strategy:
- * - We block the page (lock body scroll) and display a branded loader until
- *   EVERY frame is decoded. Only then do we reveal the site — this guarantees
- *   the first scroll is silky, since no frame is ever missing.
- * - After ready, we lerp `current` toward `target` on every rAF tick so quick
- *   scroll input translates into a smooth camera glide.
+ * Loading strategy (two phases):
+ * 1. Fast start — fully decode a small initial batch of frames (high
+ *    priority, high concurrency) and reveal the site the moment those are
+ *    ready. This is what the loader bar (0→100%) tracks.
+ * 2. Background stream — the remaining frames keep decoding quietly at a
+ *    lower concurrency. If the user scrolls ahead of what's ready, we draw
+ *    the nearest frame that IS ready instead of nothing.
+ *
+ * Why createImageBitmap instead of `new Image()` + onload:
+ * `onload` only means the bytes have arrived — the browser still has to
+ * decode the jpeg into pixels the first time it's drawn, and that decode
+ * happens synchronously on the main thread mid-scroll, which is exactly
+ * what caused the "hangs the first time, smooth after" symptom (once a
+ * frame's been drawn once, it's decoded and cached). createImageBitmap()
+ * decodes fully, off the main thread, before we ever call drawImage, so
+ * there's no first-draw jank.
  */
+const INITIAL_BATCH = 24; // enough for the first stretch of scroll; loads almost instantly
+const INITIAL_CONCURRENCY = 16;
+const BACKGROUND_CONCURRENCY = 4;
+
+type Frame = ImageBitmap | HTMLImageElement;
+
+function frameSize(img: Frame): { w: number; h: number } {
+  if (img instanceof HTMLImageElement) {
+    return { w: img.naturalWidth, h: img.naturalHeight };
+  }
+  return { w: img.width, h: img.height };
+}
+
+function findNearestLoaded(
+  frames: (Frame | null)[],
+  idx: number
+): Frame | null {
+  if (frames[idx]) return frames[idx];
+  const max = frames.length;
+  for (let r = 1; r < max; r++) {
+    if (idx - r >= 0 && frames[idx - r]) return frames[idx - r];
+    if (idx + r < max && frames[idx + r]) return frames[idx + r];
+  }
+  return null;
+}
+
+// Fetches + fully decodes a frame off the main thread. Falls back to a
+// plain <img> + decode() for browsers without createImageBitmap support.
+async function loadFrame(url: string, priority: boolean): Promise<Frame | null> {
+  try {
+    const res = await fetch(url, { priority: priority ? "high" : "low" } as RequestInit);
+    if (!res.ok) throw new Error("fetch failed");
+    const blob = await res.blob();
+    return await createImageBitmap(blob);
+  } catch {
+    try {
+      return await new Promise<Frame | null>((resolve) => {
+        const img = new Image();
+        img.decoding = "async";
+        img.onload = () => {
+          if (typeof img.decode === "function") {
+            img.decode().then(() => resolve(img)).catch(() => resolve(img));
+          } else {
+            resolve(img);
+          }
+        };
+        img.onerror = () => resolve(null);
+        img.src = url;
+      });
+    } catch {
+      return null;
+    }
+  }
+}
+
 export function ScrollFramesCanvas({ progress }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const imagesRef = useRef<(HTMLImageElement | null)[]>([]);
+  const framesRef = useRef<(Frame | null)[]>([]);
   const targetRef = useRef<number>(0);
   const currentRef = useRef<number>(0);
   const lastDrawnRef = useRef<number>(-1);
@@ -30,47 +95,67 @@ export function ScrollFramesCanvas({ progress }: Props) {
 
   const total = FRAME_URLS.length;
 
-  // Preload every frame in parallel batches; only ready when 100% decoded.
+  // Preload: fast initial batch first (fully decoded), then stream the rest.
   useEffect(() => {
-    imagesRef.current = new Array(total).fill(null);
-
+    framesRef.current = new Array(total).fill(null);
     let cancelled = false;
-    let cursor = 0;
-    const CONCURRENCY = 32;
-    let inFlight = 0;
-    let loadedCount = 0;
 
-    const loadNext = () => {
-      if (cancelled) return;
-      while (inFlight < CONCURRENCY && cursor < total) {
-        const idx = cursor++;
-        inFlight++;
-        const img = new Image();
-        img.decoding = "async";
-        img.src = FRAME_URLS[idx];
-        const done = () => {
-          if (cancelled) return;
-          inFlight--;
-          loadedCount++;
-          setLoadProgress(loadedCount / total);
-          if (loadedCount === total) setReady(true);
-          loadNext();
-        };
-        img.onload = () => {
-          imagesRef.current[idx] = img;
-          done();
-        };
-        img.onerror = done;
-      }
+    const firstBatchSize = Math.min(INITIAL_BATCH, total);
+
+    const runPool = (
+      startIdx: number,
+      endIdx: number,
+      concurrency: number,
+      priority: boolean,
+      onEach?: () => void,
+      onAllDone?: () => void
+    ) => {
+      let cursor = startIdx;
+      let inFlight = 0;
+      let done = 0;
+      const total = endIdx - startIdx;
+      const next = () => {
+        if (cancelled) return;
+        while (inFlight < concurrency && cursor < endIdx) {
+          const idx = cursor++;
+          inFlight++;
+          loadFrame(FRAME_URLS[idx], priority).then((frame) => {
+            if (cancelled) return;
+            framesRef.current[idx] = frame;
+            inFlight--;
+            done++;
+            onEach?.();
+            if (done === total) onAllDone?.();
+            next();
+          });
+        }
+      };
+      next();
     };
-    loadNext();
+
+    let firstDone = 0;
+    runPool(
+      0,
+      firstBatchSize,
+      INITIAL_CONCURRENCY,
+      true,
+      () => {
+        firstDone++;
+        setLoadProgress(firstDone / firstBatchSize);
+      },
+      () => {
+        setReady(true);
+        // Phase 2: stream the rest quietly in the background.
+        runPool(firstBatchSize, total, BACKGROUND_CONCURRENCY, false);
+      }
+    );
 
     return () => {
       cancelled = true;
     };
   }, [total]);
 
-  // Lock the page while frames are loading so the first scroll is smooth.
+  // Lock the page while the initial batch is loading so the first scroll is smooth.
   useEffect(() => {
     if (ready) return;
     const prevHtml = document.documentElement.style.overflow;
@@ -108,7 +193,8 @@ export function ScrollFramesCanvas({ progress }: Props) {
     targetRef.current = Math.min(1, Math.max(0, progress));
   }, [progress]);
 
-  // rAF loop: lerp current → target and paint.
+  // rAF loop: lerp current → target and paint, falling back to the nearest
+  // already-decoded frame if the exact one hasn't streamed in yet.
   useEffect(() => {
     if (!ready) return;
     const canvas = canvasRef.current;
@@ -125,12 +211,11 @@ export function ScrollFramesCanvas({ progress }: Props) {
       const idx = Math.round(currentRef.current * (total - 1));
 
       if (idx !== lastDrawnRef.current && idx >= 0) {
-        const img = imagesRef.current[idx];
+        const img = findNearestLoaded(framesRef.current, idx);
         if (img) {
           const cw = canvas.width;
           const ch = canvas.height;
-          const iw = img.naturalWidth;
-          const ih = img.naturalHeight;
+          const { w: iw, h: ih } = frameSize(img);
           const scale = Math.max(cw / iw, ch / ih);
           const dw = iw * scale;
           const dh = ih * scale;
@@ -198,4 +283,3 @@ export function ScrollFramesCanvas({ progress }: Props) {
     </>
   );
 }
-
